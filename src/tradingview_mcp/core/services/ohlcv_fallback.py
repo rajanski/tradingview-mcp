@@ -20,8 +20,9 @@ Limits:
 - Values are calculated locally and differ a little from TradingView's. The
   pivot columns and three of the per-indicator ``Rec.*`` votes stay None, so
   the ``Recommend.*`` ratings use only the indicators calculated here.
-- Tiingo intraday bars are IEX bars: IEX trades and IEX volume only, in clock
-  hours. Free keys allow 50 requests per hour and 1000 per day.
+- Tiingo intraday bars are IEX bars: IEX trades and IEX volume only. Its 1h
+  and 4h bars are grouped from 15min bars from 9:30 New York time, the US
+  session open. Free keys allow 50 requests per hour and 1000 per day.
 - Alpha Vantage free keys allow 25 requests per day and no intraday data.
 - The caps below count this process's requests in rolling windows, which is
   stricter than any fixed hour or day the API resets on.
@@ -50,6 +51,7 @@ import urllib.request
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .indicators import AVERAGE_VOLUME, RELATIVE_VOLUME
 from .indicators_calc import (
@@ -95,6 +97,20 @@ _GROUP_KEYS = {
     "1M": lambda ts: datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m"),
 }
 
+# US stock 1h and 4h bars start at the 9:30 New York session open
+# (9:30-10:30 ... 15:30-16:00, and 9:30-13:30, 13:30-16:00), not on clock hours.
+_NEW_YORK = ZoneInfo("America/New_York")
+
+
+def _session_key(hours: int):
+    def key(ts: int) -> tuple:
+        t = datetime.fromtimestamp(ts, _NEW_YORK)
+        return t.date(), (t.hour * 60 + t.minute - 570) // (60 * hours)
+    return key
+
+
+_TIINGO_GROUP_KEYS = {**_GROUP_KEYS, "1h": _session_key(1), "4h": _session_key(4)}
+
 _INTRADAY_SECONDS = {"5m": 300, "15m": 900, "1h": 3600}
 _YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
 _UA = "Mozilla/5.0 (compatible; tradingview-mcp)"
@@ -110,12 +126,13 @@ _AV_FUNCTIONS = {
 _TIINGO_URL = "https://api.tiingo.com"
 # timeframe -> (Tiingo path, IEX resampleFreq, days of history). Measured on
 # 2026-11-07 with a free key: 5 years of end-of-day rows, 365 days of IEX
-# 1hour rows. 4h, 1W and 1M are grouped here (see _GROUP_KEYS).
+# 1hour rows, 150 days of 15min rows (2808 rows in one answer). 1h, 4h, 1W
+# and 1M are grouped here (see _TIINGO_GROUP_KEYS).
 _TIINGO_INTERVALS = {
     "5m": ("iex", "5min", 7),
     "15m": ("iex", "15min", 30),
-    "1h": ("iex", "1hour", 90),
-    "4h": ("iex", "1hour", 365),
+    "1h": ("iex", "15min", 90),
+    "4h": ("iex", "15min", 150),
     "1D": ("tiingo/daily", None, 730),
     "1W": ("tiingo/daily", None, 1825),
     "1M": ("tiingo/daily", None, 1825),
@@ -329,7 +346,7 @@ def _fetch_tiingo(ticker: str, timeframe: str) -> list[dict] | None:
         except (KeyError, TypeError, ValueError, AttributeError):
             continue
     candles.reverse()
-    group = _GROUP_KEYS.get(timeframe)
+    group = _TIINGO_GROUP_KEYS.get(timeframe)
     if group:
         candles = _group(candles, group)
     _TIINGO.store((symbol, timeframe), candles)

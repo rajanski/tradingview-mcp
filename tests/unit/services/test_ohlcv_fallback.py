@@ -250,6 +250,30 @@ def test_tiingo_prices_are_split_adjusted(monkeypatch):
     assert [b["volume"] for b in bars] == [10_000, 10_010, 1_002, 1_003]
 
 
+@pytest.mark.parametrize("open_utc", [
+    datetime(2026, 11, 6, 14, 30, tzinfo=timezone.utc),  # 9:30 EST
+    datetime(2026, 7, 6, 13, 30, tzinfo=timezone.utc),   # 9:30 EDT
+])
+@pytest.mark.parametrize("timeframe, rows_per_bar", [
+    ("1h", [4, 4, 4, 4, 4, 4, 2]),  # 9:30-10:30 ... 15:30-16:00
+    ("4h", [16, 10]),               # 9:30-13:30, 13:30-16:00
+])
+def test_tiingo_1h_and_4h_bars_start_at_the_session_open(monkeypatch, open_utc, timeframe, rows_per_bar):
+    monkeypatch.setenv("TIINGO_API_KEY", "TIINGOKEY7")
+    net = _Net(tiingo=lambda u: _tiingo_rows(n=26, step=900, start=int(open_utc.timestamp())))
+    monkeypatch.setattr(fb, "_get_json", net)
+
+    bars = fb._fetch_tiingo("AAPL", timeframe)
+    assert "resampleFreq=15min" in net.urls[-1]
+    assert len(bars) == len(rows_per_bar)
+    first = 0
+    for bar, n in zip(bars, rows_per_bar):
+        assert bar["open"] == _price(first) - 0.5
+        assert bar["close"] == _price(first + n - 1)
+        assert bar["volume"] == sum(1_000 + i for i in range(first, first + n))
+        first += n
+
+
 def test_tiingo_weekly_bars_are_grouped_from_daily_rows(monkeypatch):
     monkeypatch.setenv("TIINGO_API_KEY", "TIINGOKEY7")
     monday = 1_699_833_600  # 2023-11-13 00:00 UTC
