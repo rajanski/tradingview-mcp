@@ -249,10 +249,13 @@ def _get_json(url: str, proxy_retry: bool = False, headers: dict | None = None) 
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _fetch_yahoo(yahoo_symbol: str, timeframe: str) -> list[dict]:
+def _fetch_yahoo(yahoo_symbol: str, timeframe: str, us_session: bool = False) -> list[dict]:
     """Bars from Yahoo's chart API, oldest first. Prices are not rounded
     (backtest_service._fetch_ohlcv rounds to 4 decimals, which zeroes
-    small-price coins), and not dividend-adjusted, like TradingView's."""
+    small-price coins), and not dividend-adjusted, like TradingView's.
+    4h bars are grouped from 1h bars: with ``us_session`` from the 9:30 New
+    York open (Yahoo's US stock 1h bars start at 9:30, 10:30, ... measured
+    2026-11-07), else in UTC blocks."""
     interval, period = _YAHOO_INTERVALS[timeframe]
     url = f"{_YAHOO_URL}/{urllib.parse.quote(yahoo_symbol)}?interval={interval}&range={period}"
     data = _get_json(url, proxy_retry=True)
@@ -270,7 +273,9 @@ def _fetch_yahoo(yahoo_symbol: str, timeframe: str) -> list[dict]:
     step = _INTRADAY_SECONDS.get(interval)
     if step and len(candles) > 1 and candles[-1]["ts"] - candles[-2]["ts"] < step:
         candles.pop()
-    return _group(candles, _GROUP_KEYS["4h"]) if timeframe == "4h" else candles
+    if timeframe != "4h":
+        return candles
+    return _group(candles, _session_key(4) if us_session else _GROUP_KEYS["4h"])
 
 
 def _group(candles: list[dict], key) -> list[dict]:
@@ -633,7 +638,7 @@ def fallback_analysis(screener: str, tv_symbol: str, timeframe: str):
     if mapped is None or timeframe not in _YAHOO_INTERVALS:
         return None
     yahoo_symbol, av = mapped
-    sources = [(f"yahoo:{yahoo_symbol}", lambda: _fetch_yahoo(yahoo_symbol, timeframe))]
+    sources = [(f"yahoo:{yahoo_symbol}", lambda: _fetch_yahoo(yahoo_symbol, timeframe, us_session=screener == "america"))]
     if av and av["kind"] == "stock":
         sources.append((f"tiingo:{av['symbol']}", lambda: _fetch_tiingo(av["symbol"], timeframe)))
     if av:

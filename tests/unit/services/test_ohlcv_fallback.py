@@ -206,6 +206,33 @@ def test_4h_bars_are_built_from_1h_bars_in_utc_blocks(monkeypatch):
     assert bars[0]["volume"] == 1_000 + 1_001 + 1_002 + 1_003
 
 
+@pytest.mark.parametrize("open_utc", [
+    datetime(2026, 11, 6, 14, 30, tzinfo=timezone.utc),  # 9:30 EST
+    datetime(2026, 7, 6, 13, 30, tzinfo=timezone.utc),   # 9:30 EDT
+])
+def test_yahoo_4h_us_stock_bars_start_at_the_session_open(monkeypatch, open_utc):
+    start = int(open_utc.timestamp())  # 1h bars 9:30 .. 15:30, as Yahoo sends them
+    monkeypatch.setattr(fb, "_get_json", _Net(yahoo=lambda u: _yahoo_payload(n=7, step=3600, start=start)))
+    bars = fb._fetch_yahoo("AAPL", "4h", us_session=True)
+    assert len(bars) == 2  # 9:30-13:30, 13:30-16:00
+    assert bars[0]["close"] == _price(3)
+    assert bars[1]["open"] == _price(4) - 0.5
+    assert bars[1]["volume"] == 1_004 + 1_005 + 1_006
+
+
+def test_only_us_stocks_get_session_bars_from_yahoo(monkeypatch):
+    asked: list[bool] = []
+
+    def fetch(symbol, timeframe, us_session=False):
+        asked.append(us_session)
+        raise ConnectionError("down")
+
+    monkeypatch.setattr(fb, "_fetch_yahoo", fetch)
+    fb.fallback_analysis("america", "NASDAQ:AAPL", "4h")
+    fb.fallback_analysis("crypto", "KUCOIN:BTCUSDT", "4h")
+    assert asked == [True, False]
+
+
 # ── Tiingo ─────────────────────────────────────────────────────────────────
 
 def test_tiingo_serves_stocks_before_alpha_vantage(monkeypatch):
