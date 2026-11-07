@@ -7,6 +7,7 @@ All functions are pure business logic with no MCP coupling.
 from __future__ import annotations
 
 from tradingview_mcp.core.services.indicators import compute_metrics
+from tradingview_mcp.core.services.ohlcv_fallback import source_fields
 from tradingview_mcp.core.utils.validators import EXCHANGE_SCREENER
 
 try:
@@ -213,6 +214,7 @@ def run_multi_agent_analysis(
         final_decision, confidence = "HOLD", "rules disagree"
 
     return {
+        **source_fields(analysis[symbol]),
         "framework_name": "Rule-Based Signal Summary",
         "method_note": (
             "Deterministic indicator checklist computed from a single delayed "

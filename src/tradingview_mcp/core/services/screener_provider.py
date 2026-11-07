@@ -525,8 +525,35 @@ def resilient_get_multiple_analysis(screener, interval, symbols):
         except Exception:
             pass
         return payload
+    # Then Yahoo / Alpha Vantage bars, for the few-symbol (single-tool) calls.
+    from .ohlcv_fallback import fallback_analyses
+    served = fallback_analyses(screener, list(symbols or []), interval)
+    if served is not None:
+        return served
     assert last_exc is not None
     raise RuntimeError(_format_transient_error(last_exc, len(delays), total_wait)) from last_exc
+
+
+def _is_terminal_transient(exc: BaseException) -> bool:
+    """True for the resilience layer's own "all retries failed" error, the
+    only error the Yahoo / Alpha Vantage fallback may answer. Other errors
+    (an unknown symbol, a bad column) stay errors."""
+    return str(exc).startswith("Upstream TradingView scanner returned transient")
+
+
+def _fallback_columns(screener, interval, symbols, columns, exc) -> Optional[Dict[str, Dict[str, Any]]]:
+    """``resilient_scan_columns`` rows from Yahoo / Alpha Vantage bars for a
+    few-symbol call, or None. Each row also gets ``data_source``."""
+    if not _is_terminal_transient(exc):
+        return None
+    from .ohlcv_fallback import fallback_analyses
+    served = fallback_analyses(screener, list(symbols), interval)
+    if served is None:
+        return None
+    return {
+        sym: {**{c: a.indicators.get(c) for c in columns}, 'data_source': a.data_source}
+        for sym, a in served.items() if a is not None
+    }
 
 
 # Column suffix per timeframe, exactly as tradingview_ta builds it: the daily
@@ -588,7 +615,13 @@ def resilient_scan_columns(
         )
         # Callers rank on their own metric; a server-side sort is wasted work.
         q.query.pop('sort', None)
-        payload = _scan_with_retry(q, cache_key=cache_key, raw=True, throttle=True)
+        try:
+            payload = _scan_with_retry(q, cache_key=cache_key, raw=True, throttle=True)
+        except RuntimeError as exc:
+            served = _fallback_columns(screener, interval, symbols, columns, exc)
+            if served is None:
+                raise
+            return served
 
     out: Dict[str, Dict[str, Any]] = {}
     for row in payload.get('data') or []:
@@ -651,7 +684,16 @@ def resilient_multi_timeframe_analysis(
             .limit(1)
         )
         q.query.pop('sort', None)
-        payload = _scan_with_retry(q, cache_key=cache_key, raw=True, throttle=True)
+        try:
+            payload = _scan_with_retry(q, cache_key=cache_key, raw=True, throttle=True)
+        except RuntimeError as exc:
+            if not _is_terminal_transient(exc):
+                raise
+            from .ohlcv_fallback import fallback_analysis
+            served = {tf: fallback_analysis(screener, symbol, tf) for tf in timeframes}
+            if not any(a is not None for a in served.values()):
+                raise
+            return served
 
     rows = [r for r in (payload.get('data') or []) if isinstance(r, dict)]
     row = next((r for r in rows if str(r.get('s', '')).upper() == symbol.upper()), rows[0] if rows else None)

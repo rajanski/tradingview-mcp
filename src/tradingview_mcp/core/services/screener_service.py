@@ -27,6 +27,7 @@ from tradingview_mcp.core.errors import (
 from tradingview_mcp.core.types import IndicatorMap, Row
 from tradingview_mcp.core.services.coinlist import exchanges_listing_symbol, load_symbols
 from tradingview_mcp.core.services.indicators import compute_metrics
+from tradingview_mcp.core.services.ohlcv_fallback import source_fields
 from tradingview_mcp.core.utils.validators import (
     EXCHANGE_SCREENER,
     get_market_type,
@@ -808,6 +809,7 @@ def analyze_coin(
                         trade_data["trade_notes"] = quality["notes"]
 
         return {
+            **source_fields(data),
             "symbol": full_symbol,
             "exchange": exchange,
             "timeframe": timeframe,
@@ -1216,6 +1218,7 @@ def run_multi_timeframe_analysis(
     ]
 
     return {
+        **source_fields(*analyses.values()),
         "symbol": symbol,
         "exchange": exchange,
         "analysis_type": "Multi-Timeframe Alignment",

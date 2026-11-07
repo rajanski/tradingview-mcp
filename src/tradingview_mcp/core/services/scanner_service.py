@@ -31,6 +31,7 @@ from tradingview_mcp.core.services.screener_service import (
     symbol_not_found_error,
 )
 from tradingview_mcp.core.services.indicators import compute_metrics
+from tradingview_mcp.core.services.ohlcv_fallback import source_fields
 from tradingview_mcp.core.services.screener_provider import (
     humanize_upstream_error,
     resilient_scan_columns,
@@ -343,6 +344,7 @@ def volume_confirmation_analyze(
             volume_strength = "WEAK"
 
         return {
+            **source_fields(ind),
             "symbol": symbol,
             "price_data": {
                 "close": close,
