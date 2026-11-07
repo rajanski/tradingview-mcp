@@ -5,12 +5,13 @@ minutes at a time. The resilience layer in ``screener_provider`` retries and
 serves its stale cache; when both fail, the single-symbol tools
 (coin_analysis, multi_timeframe_analysis, multi_agent_analysis, ...) come here.
 
-This module gets OHLCV bars from Yahoo Finance first and, for 1D/1W/1M only,
-from Alpha Vantage second (``ALPHAVANTAGE_API_KEY``). It calculates the
-TradingView indicator columns from the bars and builds the same
-``tradingview_ta`` ``Analysis`` object, so the tools need no second code path.
-Each such analysis has a ``data_source`` attribute ("yahoo:BTC-USD",
-"alphavantage:IBM") so a tool can tell its caller where the numbers came from.
+This module gets OHLCV bars from Yahoo Finance first, then from Tiingo (US
+stocks, ``TIINGO_API_KEY``), then from Alpha Vantage (1D/1W/1M stocks and 1D
+crypto, ``ALPHAVANTAGE_API_KEY``). It calculates the TradingView indicator
+columns from the bars and builds the same ``tradingview_ta`` ``Analysis``
+object, so the tools need no second code path. Each such analysis has a
+``data_source`` attribute ("yahoo:BTC-USD", "tiingo:AAPL", "alphavantage:IBM")
+so a tool can tell its caller where the numbers came from.
 
 Limits:
 - Only symbols with a known mapping: crypto pairs, US stocks, BIST, EGX,
@@ -19,12 +20,19 @@ Limits:
 - Values are calculated locally and differ a little from TradingView's. The
   pivot columns and three of the per-indicator ``Rec.*`` votes stay None, so
   the ``Recommend.*`` ratings use only the indicators calculated here.
-- Alpha Vantage free keys allow 25 requests per day and no intraday data. The
-  daily cap below (``ALPHAVANTAGE_DAILY_LIMIT``) keeps us inside it.
+- Tiingo intraday bars are IEX bars: IEX trades and IEX volume only, in clock
+  hours. Free keys allow 50 requests per hour and 1000 per day.
+- Alpha Vantage free keys allow 25 requests per day and no intraday data.
+- The caps below count this process's requests in rolling windows, which is
+  stricter than any fixed hour or day the API resets on.
 
 Tunables (env vars):
+  TIINGO_API_KEY              unset = Tiingo is not used
+  TIINGO_HOURLY_LIMIT         default 50 (requests per rolling hour)
+  TIINGO_DAILY_LIMIT          default 1000 (requests per rolling 24 hours)
+  TIINGO_CACHE_TTL            default 300 (seconds a Tiingo answer is reused)
   ALPHAVANTAGE_API_KEY        unset = Alpha Vantage is not used
-  ALPHAVANTAGE_DAILY_LIMIT    default 25 (requests per UTC day, this process)
+  ALPHAVANTAGE_DAILY_LIMIT    default 25 (requests per rolling 24 hours)
   ALPHAVANTAGE_CACHE_TTL      default 3600 (seconds an Alpha Vantage answer is reused)
 """
 from __future__ import annotations
@@ -36,10 +44,11 @@ import os
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .indicators import AVERAGE_VOLUME, RELATIVE_VOLUME
@@ -66,15 +75,24 @@ _CRYPTO_QUOTES = (
 )
 _YAHOO_SUFFIX = {"BIST": ".IS", "EGX": ".CA", "TADAWUL": ".SR"}
 
-# timeframe -> (Yahoo interval, Yahoo range, Yahoo bars per output bar)
+# timeframe -> (Yahoo interval, Yahoo range). 4h is grouped from 1h.
 _YAHOO_INTERVALS = {
-    "5m": ("5m", "5d", 1),
-    "15m": ("15m", "1mo", 1),
-    "1h": ("1h", "3mo", 1),
-    "4h": ("1h", "1y", 4),
-    "1D": ("1d", "2y", 1),
-    "1W": ("1wk", "10y", 1),
-    "1M": ("1mo", "max", 1),
+    "5m": ("5m", "5d"),
+    "15m": ("15m", "1mo"),
+    "1h": ("1h", "3mo"),
+    "4h": ("1h", "1y"),
+    "1D": ("1d", "2y"),
+    "1W": ("1wk", "10y"),
+    "1M": ("1mo", "max"),
+}
+
+# Bars merged into one output bar share this key of their UTC start time:
+# 4h blocks 00-04, 04-08, ... like TradingView's crypto 4h bars, ISO weeks
+# (Monday start) and calendar months.
+_GROUP_KEYS = {
+    "4h": lambda ts: ts // (3600 * 4),
+    "1W": lambda ts: datetime.fromtimestamp(ts, timezone.utc).isocalendar()[:2],
+    "1M": lambda ts: datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m"),
 }
 
 _INTRADAY_SECONDS = {"5m": 300, "15m": 900, "1h": 3600}
@@ -88,9 +106,20 @@ _AV_FUNCTIONS = {
     ("stock", "1M"): "TIME_SERIES_MONTHLY",
     ("crypto", "1D"): "DIGITAL_CURRENCY_DAILY",
 }
-_AV_LOCK = threading.Lock()
-_AV_CACHE: dict[tuple, tuple[float, list[dict]]] = {}
-_AV_STATE: dict[str, Any] = {"day": None, "count": 0, "blocked": False}
+
+_TIINGO_URL = "https://api.tiingo.com"
+# timeframe -> (Tiingo path, IEX resampleFreq, days of history). Measured on
+# 2026-11-07 with a free key: 5 years of end-of-day rows, 365 days of IEX
+# 1hour rows. 4h, 1W and 1M are grouped here (see _GROUP_KEYS).
+_TIINGO_INTERVALS = {
+    "5m": ("iex", "5min", 7),
+    "15m": ("iex", "15min", 30),
+    "1h": ("iex", "1hour", 90),
+    "4h": ("iex", "1hour", 365),
+    "1D": ("tiingo/daily", None, 730),
+    "1W": ("tiingo/daily", None, 1825),
+    "1M": ("tiingo/daily", None, 1825),
+}
 
 DATA_NOTE = (
     "TradingView did not answer, so these values come from {source} price bars "
@@ -109,6 +138,59 @@ def _env_float(name: str, default: float) -> float:
         return float(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
+
+
+class _Quota:
+    """Requests this process may still send to one keyed API: a cap per
+    rolling window, a stop after the API itself reports its limit, and a
+    cache of the answers."""
+
+    def __init__(self, windows: dict[int, tuple[str, float]], ttl: tuple[str, float]):
+        self.windows = windows  # seconds -> (env var, default cap)
+        self.ttl = ttl  # (env var, default seconds)
+        self.lock = threading.Lock()
+        self.cache: dict[Any, tuple[float, list[dict]]] = {}
+        self.sent: list[float] = []
+        self.blocked_until = 0.0
+
+    def cached(self, key: Any) -> list[dict] | None:
+        with self.lock:
+            hit = self.cache.get(key)
+        if hit and time.time() - hit[0] < _env_float(*self.ttl):
+            return hit[1]
+        return None
+
+    def store(self, key: Any, candles: list[dict]) -> None:
+        with self.lock:
+            self.cache[key] = (time.time(), candles)
+
+    def take(self) -> bool:
+        """Count one request, or False when a cap or a block says no."""
+        now = time.time()
+        with self.lock:
+            if now < self.blocked_until:
+                return False
+            self.sent = [t for t in self.sent if now - t < max(self.windows)]
+            for seconds, (var, default) in self.windows.items():
+                if sum(now - t < seconds for t in self.sent) >= _env_float(var, default):
+                    return False
+            self.sent.append(now)
+            return True
+
+    def block(self, seconds: float) -> None:
+        with self.lock:
+            self.blocked_until = time.time() + seconds
+
+    def reset(self) -> None:
+        with self.lock:
+            self.cache.clear()
+            self.sent.clear()
+            self.blocked_until = 0.0
+
+
+_TIINGO = _Quota({3600: ("TIINGO_HOURLY_LIMIT", 50), 86_400: ("TIINGO_DAILY_LIMIT", 1000)},
+                 ("TIINGO_CACHE_TTL", 300))
+_AV = _Quota({86_400: ("ALPHAVANTAGE_DAILY_LIMIT", 25)}, ("ALPHAVANTAGE_CACHE_TTL", 3600))
 
 
 # ── Symbol mapping ────────────────────────────────────────────────────────────
@@ -135,10 +217,10 @@ def provider_symbols(screener: str, tv_symbol: str) -> tuple[str, dict | None] |
 
 # ── Bar sources ───────────────────────────────────────────────────────────────
 
-def _get_json(url: str, proxy_retry: bool = False) -> Any:
+def _get_json(url: str, proxy_retry: bool = False, headers: dict | None = None) -> Any:
     """GET ``url`` as JSON. With ``proxy_retry``, a failed direct request is
     sent again through the configured proxy, as backtest_service does."""
-    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    req = urllib.request.Request(url, headers={"User-Agent": _UA, **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -154,7 +236,7 @@ def _fetch_yahoo(yahoo_symbol: str, timeframe: str) -> list[dict]:
     """Bars from Yahoo's chart API, oldest first. Prices are not rounded
     (backtest_service._fetch_ohlcv rounds to 4 decimals, which zeroes
     small-price coins), and not dividend-adjusted, like TradingView's."""
-    interval, period, group = _YAHOO_INTERVALS[timeframe]
+    interval, period = _YAHOO_INTERVALS[timeframe]
     url = f"{_YAHOO_URL}/{urllib.parse.quote(yahoo_symbol)}?interval={interval}&range={period}"
     data = _get_json(url, proxy_retry=True)
     result = data["chart"]["result"][0]
@@ -171,21 +253,87 @@ def _fetch_yahoo(yahoo_symbol: str, timeframe: str) -> list[dict]:
     step = _INTRADAY_SECONDS.get(interval)
     if step and len(candles) > 1 and candles[-1]["ts"] - candles[-2]["ts"] < step:
         candles.pop()
-    if group == 1:
-        return candles
-    # 4h bars from 1h bars, in UTC blocks 00-04, 04-08, ... like TradingView's crypto bars.
+    return _group(candles, _GROUP_KEYS["4h"]) if timeframe == "4h" else candles
+
+
+def _group(candles: list[dict], key) -> list[dict]:
+    """Consecutive bars with the same ``key(ts)`` merged into one bar."""
     out: list[dict] = []
+    last = None
     for c in candles:
-        block = c["ts"] // (3600 * group)
-        if out and out[-1]["_block"] == block:
+        k = key(c["ts"])
+        if out and k == last:
             bar = out[-1]
             bar["high"] = max(bar["high"], c["high"])
             bar["low"] = min(bar["low"], c["low"])
             bar["close"] = c["close"]
             bar["volume"] += c["volume"]
         else:
-            out.append({**c, "_block": block})
+            out.append(dict(c))
+            last = k
     return out
+
+
+def _fetch_tiingo(ticker: str, timeframe: str) -> list[dict] | None:
+    """US stock bars from Tiingo, oldest first: IEX bars intraday, end-of-day
+    bars from 1D up. Split-adjusted, not dividend-adjusted, like TradingView's."""
+    key = os.environ.get("TIINGO_API_KEY", "").strip()
+    if not key:
+        return None
+    path, freq, days = _TIINGO_INTERVALS[timeframe]
+    symbol = ticker.replace(".", "-").lower()  # BRK.B is brk-b (measured)
+    cached = _TIINGO.cached((symbol, timeframe))
+    if cached is not None:
+        return cached
+    if not _TIINGO.take():
+        return None
+    start = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+    query = {"startDate": start}
+    if freq:
+        # IEX sends no volume unless the columns are named.
+        query.update(resampleFreq=freq, columns="open,high,low,close,volume")
+    url = f"{_TIINGO_URL}/{path}/{urllib.parse.quote(symbol)}/prices?{urllib.parse.urlencode(query)}"
+    try:
+        # The key goes in the header, never in the URL.
+        rows = _get_json(url, headers={"Authorization": f"Token {key}"})
+    except urllib.error.HTTPError as e:
+        # 429 is the usual HTTP rate-limit status. Tiingo's documentation does
+        # not name one (read 2026-11-07), so this is not verified.
+        if e.code == 429:
+            _TIINGO.block(3600)
+        _log(f"Tiingo {path} {symbol} failed: HTTP {e.code}")
+        return None
+    except Exception as e:  # noqa: BLE001
+        _log(f"Tiingo {path} {symbol} failed: {type(e).__name__}")
+        return None
+    if not isinstance(rows, list):
+        _log(f"Tiingo {path} {symbol} gave no data: {str(rows)[:200]}")
+        return None
+
+    # End-of-day prices are as traded. splitFactor on the split day (NVDA
+    # 2024-06-10: 10.0) divides the prices of all earlier rows.
+    candles: list[dict] = []
+    factor = 1.0
+    for r in reversed(rows):
+        try:
+            ts = int(datetime.fromisoformat(r["date"].replace("Z", "+00:00")).timestamp())
+            candles.append({
+                "ts": ts,
+                "open": float(r["open"]) / factor,
+                "high": float(r["high"]) / factor,
+                "low": float(r["low"]) / factor,
+                "close": float(r["close"]) / factor,
+                "volume": float(r.get("volume") or 0) * factor,
+            })
+            factor *= float(r.get("splitFactor") or 1.0)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+    candles.reverse()
+    group = _GROUP_KEYS.get(timeframe)
+    if group:
+        candles = _group(candles, group)
+    _TIINGO.store((symbol, timeframe), candles)
+    return candles
 
 
 def _fetch_alpha_vantage(av: dict, timeframe: str) -> list[dict] | None:
@@ -197,16 +345,11 @@ def _fetch_alpha_vantage(av: dict, timeframe: str) -> list[dict] | None:
     if av["kind"] == "crypto":
         params["market"] = av["market"]
     cache_key = tuple(sorted(params.items()))
-    today = datetime.now(timezone.utc).date()
-    with _AV_LOCK:
-        hit = _AV_CACHE.get(cache_key)
-        if hit and time.time() - hit[0] < _env_float("ALPHAVANTAGE_CACHE_TTL", 3600):
-            return hit[1]
-        if _AV_STATE["day"] != today:
-            _AV_STATE.update(day=today, count=0, blocked=False)
-        if _AV_STATE["blocked"] or _AV_STATE["count"] >= _env_float("ALPHAVANTAGE_DAILY_LIMIT", 25):
-            return None
-        _AV_STATE["count"] += 1
+    cached = _AV.cached(cache_key)
+    if cached is not None:
+        return cached
+    if not _AV.take():
+        return None
 
     url = f"{_AV_URL}?{urllib.parse.urlencode({**params, 'apikey': key})}"
     try:
@@ -222,8 +365,7 @@ def _fetch_alpha_vantage(av: dict, timeframe: str) -> list[dict] | None:
         # "Information" / "Note" is the daily or per-minute limit: stop for today.
         # "Error Message" is an unknown symbol: only this request fails.
         if "Information" in body or "Note" in body:
-            with _AV_LOCK:
-                _AV_STATE["blocked"] = True
+            _AV.block(86_400 - time.time() % 86_400)  # until the next UTC day
         _log(f"Alpha Vantage {function} {av['symbol']} gave no data: {str(body)[:200]}")
         return None
 
@@ -241,8 +383,7 @@ def _fetch_alpha_vantage(av: dict, timeframe: str) -> list[dict] | None:
             })
         except (KeyError, TypeError, ValueError):
             continue
-    with _AV_LOCK:
-        _AV_CACHE[cache_key] = (time.time(), candles)
+    _AV.store(cache_key, candles)
     return candles
 
 
@@ -469,26 +610,30 @@ def build_analysis(candles: list[dict], screener: str, tv_symbol: str, timeframe
 
 
 def fallback_analysis(screener: str, tv_symbol: str, timeframe: str):
-    """``Analysis`` from Yahoo / Alpha Vantage bars, or None when neither has
-    usable bars for this symbol and timeframe."""
+    """``Analysis`` from Yahoo, Tiingo or Alpha Vantage bars (first with
+    enough bars wins), or None when none has usable bars."""
     mapped = provider_symbols(screener, tv_symbol)
     if mapped is None or timeframe not in _YAHOO_INTERVALS:
         return None
     yahoo_symbol, av = mapped
+    sources = [(f"yahoo:{yahoo_symbol}", lambda: _fetch_yahoo(yahoo_symbol, timeframe))]
+    if av and av["kind"] == "stock":
+        sources.append((f"tiingo:{av['symbol']}", lambda: _fetch_tiingo(av["symbol"], timeframe)))
+    if av:
+        sources.append((f"alphavantage:{av['symbol']}", lambda: _fetch_alpha_vantage(av, timeframe)))
     # A fallback must never replace the TradingView error with its own, so
     # every failure here ends as None.
-    candles: list[dict] | None = None
-    source = f"yahoo:{yahoo_symbol}"
+    for source, fetch in sources:
+        try:
+            candles = fetch()
+        except Exception as e:  # noqa: BLE001 - any failure moves on to the next source
+            _log(f"fallback {source} {timeframe} failed: {e!r}")
+            continue
+        if candles and len(candles) >= _MIN_BARS:
+            break
+    else:
+        return None
     try:
-        candles = _fetch_yahoo(yahoo_symbol, timeframe)
-    except Exception as e:  # noqa: BLE001 - any Yahoo failure moves on to Alpha Vantage
-        _log(f"Yahoo fallback {yahoo_symbol} {timeframe} failed: {e!r}")
-    try:
-        if (not candles or len(candles) < _MIN_BARS) and av:
-            candles = _fetch_alpha_vantage(av, timeframe)
-            source = f"alphavantage:{av['symbol']}"
-        if not candles or len(candles) < _MIN_BARS:
-            return None
         analysis = build_analysis(candles, screener, tv_symbol, timeframe)
     except Exception as e:  # noqa: BLE001
         _log(f"fallback analysis for {tv_symbol} {timeframe} failed: {e!r}")

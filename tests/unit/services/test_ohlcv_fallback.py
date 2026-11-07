@@ -1,15 +1,18 @@
-"""Yahoo / Alpha Vantage fallback for when the TradingView scanner keeps failing.
+"""Yahoo / Tiingo / Alpha Vantage fallback for when the TradingView scanner keeps failing.
 
 On the self-hosted server (2026-10-29 .. 2026-11-07) every request that got an
 empty body also failed its two retries, 50 of 50, so the tools returned errors.
-The single-symbol tools now get bars from Yahoo (then Alpha Vantage for
-1D/1W/1M), calculate the indicators locally and say so in ``data_source``.
+The single-symbol tools now get bars from Yahoo (then Tiingo for US stocks,
+then Alpha Vantage for 1D/1W/1M), calculate the indicators locally and say so
+in ``data_source``.
 """
 from __future__ import annotations
 
 import json
 import math
+import urllib.error
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -74,17 +77,36 @@ def _av_payload(n: int = 100) -> dict:
     return {"Meta Data": {}, "Time Series (Daily)": newest_first}
 
 
+def _tiingo_rows(n: int = 300, step: int = 86_400, start: int = 1_699_920_000) -> list[dict]:
+    rows = []
+    for i in range(n):
+        p = _price(i)
+        date = datetime.fromtimestamp(start + i * step, timezone.utc)
+        rows.append({"date": date.strftime("%Y-%m-%dT%H:%M:%S.000Z"), "open": p - 0.5,
+                     "high": p + 1, "low": p - 1, "close": p, "volume": 1_000 + i,
+                     "splitFactor": 1.0})
+    return rows
+
+
 class _Net:
-    """Stands in for ``ohlcv_fallback._get_json``; records every URL."""
+    """Stands in for ``ohlcv_fallback._get_json``; records every URL and header."""
 
     def __init__(self, yahoo: Callable[[str], Any] | None = None,
-                 av: Callable[[str], Any] | None = None):
+                 av: Callable[[str], Any] | None = None,
+                 tiingo: Callable[[str], Any] | None = None):
         self.urls: list[str] = []
-        self._yahoo, self._av = yahoo, av
+        self.headers: list[dict] = []
+        self._yahoo, self._av, self._tiingo = yahoo, av, tiingo
 
-    def __call__(self, url: str, proxy_retry: bool = False) -> Any:
+    def __call__(self, url: str, proxy_retry: bool = False, headers: dict | None = None) -> Any:
         self.urls.append(url)
-        handler = self._av if "alphavantage" in url else self._yahoo
+        self.headers.append(headers or {})
+        if "alphavantage" in url:
+            handler = self._av
+        elif "tiingo" in url:
+            handler = self._tiingo
+        else:
+            handler = self._yahoo
         if handler is None:
             raise ConnectionError("down")
         return handler(url)
@@ -182,6 +204,102 @@ def test_4h_bars_are_built_from_1h_bars_in_utc_blocks(monkeypatch):
     assert bars[0]["close"] == _price(3)
     assert bars[0]["high"] == max(_price(i) for i in range(4)) + 1
     assert bars[0]["volume"] == 1_000 + 1_001 + 1_002 + 1_003
+
+
+# ── Tiingo ─────────────────────────────────────────────────────────────────
+
+def test_tiingo_serves_stocks_before_alpha_vantage(monkeypatch):
+    monkeypatch.setenv("TIINGO_API_KEY", "TIINGOKEY7")
+    monkeypatch.setenv("ALPHAVANTAGE_API_KEY", "KEY123")
+    net = _Net(tiingo=lambda u: _tiingo_rows(), av=lambda u: _av_payload())
+    monkeypatch.setattr(fb, "_get_json", net)
+
+    a = fb.fallback_analysis("america", "NYSE:BRK.B", "1D")
+    assert a.data_source == "tiingo:BRK.B"
+    assert a.indicators["close"] == pytest.approx(_price(299))
+    assert "/tiingo/daily/brk-b/prices?startDate=" in net.urls[-1]
+    assert net.headers[-1] == {"Authorization": "Token TIINGOKEY7"}
+    assert not any("TIINGOKEY7" in u for u in net.urls)
+    assert net.count("alphavantage") == 0
+
+    fb.fallback_analysis("america", "NYSE:BRK.B", "1D")  # answer is reused
+    assert net.count("tiingo") == 1
+
+
+def test_tiingo_intraday_asks_iex_for_volume(monkeypatch):
+    monkeypatch.setenv("TIINGO_API_KEY", "TIINGOKEY7")
+    net = _Net(tiingo=lambda u: _tiingo_rows(step=900))
+    monkeypatch.setattr(fb, "_get_json", net)
+    assert fb.fallback_analysis("america", "NASDAQ:AAPL", "15m").data_source == "tiingo:AAPL"
+    assert "/iex/aapl/prices?" in net.urls[-1]
+    assert "resampleFreq=15min" in net.urls[-1]
+    assert "columns=open%2Chigh%2Clow%2Cclose%2Cvolume" in net.urls[-1]
+
+
+def test_tiingo_prices_are_split_adjusted(monkeypatch):
+    monkeypatch.setenv("TIINGO_API_KEY", "TIINGOKEY7")
+    rows = _tiingo_rows(n=4)
+    for r in rows[:2]:  # as traded before a 10:1 split on rows[2]
+        for k in ("open", "high", "low", "close"):
+            r[k] *= 10
+    rows[2]["splitFactor"] = 10.0
+    monkeypatch.setattr(fb, "_get_json", _Net(tiingo=lambda u: rows))
+
+    bars = fb._fetch_tiingo("NVDA", "1D")
+    assert [b["close"] for b in bars] == pytest.approx([_price(i) for i in range(4)])
+    assert [b["volume"] for b in bars] == [10_000, 10_010, 1_002, 1_003]
+
+
+def test_tiingo_weekly_bars_are_grouped_from_daily_rows(monkeypatch):
+    monkeypatch.setenv("TIINGO_API_KEY", "TIINGOKEY7")
+    monday = 1_699_833_600  # 2023-11-13 00:00 UTC
+    monkeypatch.setattr(fb, "_get_json", _Net(tiingo=lambda u: _tiingo_rows(n=10, start=monday)))
+    bars = fb._fetch_tiingo("AAPL", "1W")
+    assert len(bars) == 2  # Mon 13 .. Sun 19, Mon 20 .. Wed 22
+    assert bars[0]["open"] == _price(0) - 0.5
+    assert bars[0]["close"] == _price(6)
+    assert bars[0]["volume"] == sum(1_000 + i for i in range(7))
+
+
+def test_tiingo_hourly_limit_is_kept(monkeypatch):
+    monkeypatch.setenv("TIINGO_API_KEY", "TIINGOKEY7")
+    monkeypatch.setenv("TIINGO_HOURLY_LIMIT", "1")
+    net = _Net(tiingo=lambda u: _tiingo_rows())
+    monkeypatch.setattr(fb, "_get_json", net)
+    assert fb.fallback_analysis("america", "NYSE:IBM", "1D") is not None
+    assert fb.fallback_analysis("america", "NASDAQ:MSFT", "1D") is None
+    assert net.count("tiingo") == 1
+
+
+def test_tiingo_rate_limit_status_stops_requests_for_an_hour(monkeypatch):
+    monkeypatch.setenv("TIINGO_API_KEY", "TIINGOKEY7")
+
+    def limited(url):
+        raise urllib.error.HTTPError(url, 429, "Too Many Requests", None, None)
+
+    net = _Net(tiingo=limited)
+    monkeypatch.setattr(fb, "_get_json", net)
+    assert fb.fallback_analysis("america", "NYSE:IBM", "1D") is None
+    assert fb.fallback_analysis("america", "NASDAQ:MSFT", "1D") is None
+    assert net.count("tiingo") == 1
+
+
+def test_tiingo_failure_moves_on_to_alpha_vantage(monkeypatch):
+    monkeypatch.setenv("TIINGO_API_KEY", "TIINGOKEY7")
+    monkeypatch.setenv("ALPHAVANTAGE_API_KEY", "KEY123")
+    net = _Net(tiingo=lambda u: {"detail": "Error: Ticker 'IBM' not found"},
+               av=lambda u: _av_payload())
+    monkeypatch.setattr(fb, "_get_json", net)
+    assert fb.fallback_analysis("america", "NYSE:IBM", "1D").data_source == "alphavantage:IBM"
+    assert net.count("tiingo") == 1
+
+
+def test_tiingo_is_not_asked_for_crypto(monkeypatch):
+    monkeypatch.setenv("TIINGO_API_KEY", "TIINGOKEY7")
+    net = _Net(tiingo=lambda u: _tiingo_rows())
+    monkeypatch.setattr(fb, "_get_json", net)
+    assert fb.fallback_analysis("crypto", "KUCOIN:BTCUSDT", "1D") is None
+    assert net.count("tiingo") == 0
 
 
 # ── Alpha Vantage ──────────────────────────────────────────────────────────
